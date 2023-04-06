@@ -1,5 +1,1 @@
 test 3
-
-$whoami = whoami
-$whoami | Out-GridView -Title "Whoami Result"
-Read-Host -Prompt "Press Enter to close the window"
