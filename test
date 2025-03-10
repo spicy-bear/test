@@ -1,0 +1,408 @@
+Threat Hunting in NetFlow CSV Data
+I'll expand on the initial approaches and provide additional techniques for hunting threats in NetFlow data. Each method includes specific patterns to look for and example code implementations.
+1. Identify Long-Lived Connections (Beaconing)
+Expanded explanation:
+APTs often establish persistent command and control (C2) channels that "phone home" at regular intervals. These connections typically have consistent timing patterns to avoid detection.
+Additional implementation:
+pythonCopyimport pandas as pd
+import numpy as np
+
+# Load NetFlow data
+df = pd.read_csv("netflow.csv")
+
+# Convert timestamps to datetime objects if needed
+df['start_time'] = pd.to_datetime(df['start_time'])
+
+# Group by source, destination, and port, then analyze timing patterns
+connection_groups = df.groupby(['src_ip', 'dst_ip', 'dst_port'])
+
+# Look for regular interval patterns (low std deviation in time between connections)
+beaconing_candidates = []
+for name, group in connection_groups:
+    if len(group) > 5:  # Need multiple connections to establish a pattern
+        # Sort by timestamp
+        group = group.sort_values('start_time')
+        
+        # Calculate time differences between consecutive connections
+        time_diffs = group['start_time'].diff().dropna()
+        
+        # Calculate coefficient of variation (normalized std deviation)
+        if len(time_diffs) > 3:  # Need enough points to calculate meaningful stats
+            cv = time_diffs.std() / time_diffs.mean() if time_diffs.mean() > 0 else float('inf')
+            
+            # Low CV indicates regular intervals
+            if cv < 0.3:  # Threshold can be adjusted based on environment
+                beaconing_candidates.append({
+                    'src_ip': name[0],
+                    'dst_ip': name[1],
+                    'dst_port': name[2],
+                    'count': len(group),
+                    'avg_interval': time_diffs.mean().total_seconds(),
+                    'cv': cv
+                })
+
+beaconing_df = pd.DataFrame(beaconing_candidates)
+print(beaconing_df.sort_values('cv'))
+2. Find Large Data Exfiltration
+Expanded explanation:
+Data exfiltration often involves large data transfers to unusual destinations. Focus on identifying outliers in data volume, especially during off-hours.
+Additional implementation:
+pythonCopy# Identify unusual data transfers by time of day
+df['hour'] = df['start_time'].dt.hour
+
+# Calculate baseline traffic patterns by hour
+hourly_baselines = df.groupby('hour')['bytes_out'].agg(['mean', 'std'])
+
+# Flag transfers that exceed normal thresholds for their time period
+exfil_candidates = []
+for hour, group in df.groupby('hour'):
+    baseline = hourly_baselines.loc[hour]
+    # Flag flows with bytes_out exceeding 3 standard deviations from mean for that hour
+    threshold = baseline['mean'] + (3 * baseline['std'])
+    suspicious = group[group['bytes_out'] > threshold]
+    exfil_candidates.append(suspicious)
+
+exfil_df = pd.concat(exfil_candidates)
+
+# Further filter for sustained exfiltration (multiple large transfers to same destination)
+sustained_exfil = exfil_df.groupby(['src_ip', 'dst_ip']).filter(lambda x: len(x) >= 3)
+print(sustained_exfil[['src_ip', 'dst_ip', 'start_time', 'bytes_out']])
+3. Detect Internal Reconnaissance (Lateral Movement)
+Expanded explanation:
+After initial compromise, attackers perform internal scanning to find valuable assets. This creates unusual connection patterns from a single source to many destinations, often in rapid succession.
+Additional implementation:
+pythonCopy# Time-window based analysis for lateral movement
+df['start_time'] = pd.to_datetime(df['start_time'])
+
+# Define a function to detect rapid internal scanning
+def detect_scanning(group, time_window_minutes=10, min_targets=15):
+    # Sort by timestamp
+    group = group.sort_values('start_time')
+    
+    # Find runs of connections where many internal hosts are contacted in a short period
+    scanning_windows = []
+    window_start = group['start_time'].iloc[0]
+    current_window = set()
+    
+    for idx, row in group.iterrows():
+        # If we're still within the time window, add to current set of targets
+        if (row['start_time'] - window_start).total_seconds() <= (time_window_minutes * 60):
+            current_window.add(row['dst_ip'])
+        else:
+            # Window exceeded, check if we found enough targets
+            if len(current_window) >= min_targets:
+                scanning_windows.append({
+                    'src_ip': group['src_ip'].iloc[0],
+                    'start_time': window_start,
+                    'end_time': row['start_time'],
+                    'targets': len(current_window)
+                })
+            
+            # Start a new window
+            window_start = row['start_time']
+            current_window = {row['dst_ip']}
+    
+    # Check final window
+    if len(current_window) >= min_targets:
+        scanning_windows.append({
+            'src_ip': group['src_ip'].iloc[0],
+            'start_time': window_start,
+            'end_time': group['start_time'].iloc[-1],
+            'targets': len(current_window)
+        })
+        
+    return pd.DataFrame(scanning_windows) if scanning_windows else None
+
+# Filter for internal IPs only (example for private IP ranges)
+internal_flows = df[df['dst_ip'].str.startswith(('10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.'))]
+
+# Apply scanning detection to each source IP
+scanning_results = []
+for src_ip, group in internal_flows.groupby('src_ip'):
+    result = detect_scanning(group)
+    if result is not None:
+        scanning_results.append(result)
+
+if scanning_results:
+    all_scanning = pd.concat(scanning_results)
+    print(all_scanning.sort_values('targets', ascending=False))
+4. Spot C2 Channels Using DNS Over HTTP/S
+Expanded explanation:
+Modern C2 frameworks often tunnel commands through legitimate protocols like HTTPS or DNS to avoid detection. Look for small, frequent connections with unusual patterns.
+Additional implementation:
+pythonCopy# Identify potential C2 over HTTP/HTTPS
+http_flows = df[(df['dst_port'].isin([80, 443]))]
+
+# Calculate entropy of packet sizes to identify structured communication
+def calculate_entropy(flow_group):
+    # Shannon entropy calculation for byte counts
+    byte_counts = flow_group['bytes_out'].value_counts(normalize=True)
+    entropy = -sum(p * np.log2(p) for p in byte_counts if p > 0)
+    return entropy
+
+# Group by source-destination pairs
+c2_candidates = []
+for (src, dst), group in http_flows.groupby(['src_ip', 'dst_ip']):
+    if len(group) >= 10:  # Need multiple connections to establish a pattern
+        avg_bytes_out = group['bytes_out'].mean()
+        avg_bytes_in = group['bytes_in'].mean()
+        ratio = avg_bytes_in / avg_bytes_out if avg_bytes_out > 0 else float('inf')
+        entropy = calculate_entropy(group)
+        
+        # C2 often has low outbound bytes, consistent sizes, and unusual ratios
+        if (avg_bytes_out < 200 and 
+            entropy < 2.5 and  # Low entropy indicates structured communication
+            (ratio < 0.2 or ratio > 5)):  # Unusual ratio of inbound to outbound traffic
+            
+            c2_candidates.append({
+                'src_ip': src,
+                'dst_ip': dst,
+                'count': len(group),
+                'avg_bytes_out': avg_bytes_out,
+                'avg_bytes_in': avg_bytes_in,
+                'ratio': ratio,
+                'entropy': entropy
+            })
+
+c2_df = pd.DataFrame(c2_candidates)
+print(c2_df.sort_values('entropy'))
+5. Identify Rare or Suspicious Protocols
+Expanded explanation:
+Attackers often use uncommon protocols or port combinations to avoid detection. Historical baselines help identify these anomalies.
+Additional implementation:
+pythonCopy# Create protocol-port baseline
+proto_port_counts = df.groupby(['protocol', 'dst_port']).size()
+total_flows = len(df)
+
+# Calculate frequency of each protocol-port combination
+proto_port_freq = proto_port_counts / total_flows
+
+# Find rarely used protocol-port combinations (bottom 1%)
+rare_combos = proto_port_freq[proto_port_freq < proto_port_freq.quantile(0.01)]
+
+# Find flows using these rare combinations
+rare_flows = df.merge(
+    pd.DataFrame(rare_combos).reset_index(),
+    on=['protocol', 'dst_port']
+)
+
+# Group by destination to see if any hosts receive multiple rare protocol connections
+rare_dest_counts = rare_flows.groupby('dst_ip').size().sort_values(ascending=False)
+print(f"Top destinations receiving rare protocol traffic:\n{rare_dest_counts.head(10)}")
+
+# Identify internal hosts using rare protocols to communicate externally
+internal_sources = rare_flows[rare_flows['src_ip'].str.startswith(('10.', '172.16.', '192.168.'))]
+rare_internal_sources = internal_sources.groupby('src_ip').size().sort_values(ascending=False)
+print(f"Internal hosts using rare protocols:\n{rare_internal_sources.head(10)}")
+6. Look for New External Connections
+Expanded explanation:
+First-time connections to external IPs can indicate initial compromise or new C2 infrastructure. Compare against historical baselines to identify these.
+Additional implementation:
+pythonCopy# Load historical connections (assuming we have a list of previously seen destinations)
+try:
+    historical_df = pd.read_csv("historical_flows.csv")
+    known_destinations = set(historical_df['dst_ip'].unique())
+except FileNotFoundError:
+    # If no historical data, use the first day of current data as baseline
+    df['date'] = df['start_time'].dt.date
+    first_day = df['date'].min()
+    known_destinations = set(df[df['date'] == first_day]['dst_ip'].unique())
+    
+# Find new destinations not in our known set
+new_destinations = df[~df['dst_ip'].isin(known_destinations)]
+
+# Group by source to identify hosts connecting to many new destinations
+new_dest_by_source = new_destinations.groupby('src_ip')['dst_ip'].nunique().sort_values(ascending=False)
+top_sources = new_dest_by_source.head(10)
+
+print(f"Top internal hosts connecting to new destinations:\n{top_sources}")
+
+# Analyze temporal patterns of new connections
+new_destinations['hour'] = new_destinations['start_time'].dt.hour
+hourly_new_connections = new_destinations.groupby('hour').size()
+
+print(f"New connections by hour of day:\n{hourly_new_connections}")
+
+# Look for clusters of new connections in short time windows
+new_destinations = new_destinations.sort_values('start_time')
+time_diffs = new_destinations['start_time'].diff()
+rapid_bursts = new_destinations[time_diffs < pd.Timedelta(seconds=5)]
+
+if not rapid_bursts.empty:
+    print(f"Found {len(rapid_bursts)} connections in rapid succession to new destinations")
+7. Detect Credential Stuffing or Brute Force Attempts
+Expanded explanation:
+Authentication bruteforcing creates a pattern of many failed connections to authentication services. These typically have short durations and low byte counts.
+Additional implementation:
+pythonCopy# Focus on common authentication services
+auth_ports = [22, 23, 3389, 5900, 445, 1433, 3306, 8080, 8443]
+auth_flows = df[df['dst_port'].isin(auth_ports)]
+
+# Group by source, destination, and port
+auth_attempts = auth_flows.groupby(['src_ip', 'dst_ip', 'dst_port']).agg({
+    'flow_id': 'count',
+    'duration': 'mean',
+    'bytes_in': 'mean',
+    'bytes_out': 'mean'
+}).reset_index()
+
+# Brute force attempts typically have many short connections with little data exchange
+bruteforce_candidates = auth_attempts[
+    (auth_attempts['flow_id'] > 20) &  # Many connection attempts
+    (auth_attempts['duration'] < 2) &  # Short duration
+    (auth_attempts['bytes_in'] < 500)  # Low data transfer
+]
+
+print(bruteforce_candidates.sort_values('flow_id', ascending=False))
+
+# Analyze timing patterns to find automated attacks
+for (src, dst, port), group in auth_flows.groupby(['src_ip', 'dst_ip', 'dst_port']):
+    if len(group) > 20:  # Check only groups with many connections
+        # Sort by timestamp
+        group = group.sort_values('start_time')
+        
+        # Calculate time differences between consecutive connections
+        time_diffs = group['start_time'].diff().dropna()
+        
+        # Check for machine-like regularity (very low time variance)
+        if len(time_diffs) > 10:
+            # Convert to seconds
+            time_diffs_sec = time_diffs.dt.total_seconds()
+            
+            # Calculate coefficient of variation
+            cv = time_diffs_sec.std() / time_diffs_sec.mean() if time_diffs_sec.mean() > 0 else float('inf')
+            
+            # Very low CV indicates automated tools
+            if cv < 0.1:
+                print(f"Potential automated bruteforce: {src} -> {dst}:{port} with {len(group)} attempts")
+                print(f"Average time between attempts: {time_diffs_sec.mean():.2f} seconds")
+8. Detect Data Staging Before Exfiltration
+New technique:
+Before exfiltration, attackers often move data to collection points within the network. This creates unusual internal data flows.
+Implementation:
+pythonCopy# Focus on internal transfers
+internal_transfers = df[
+    df['src_ip'].str.match(r'^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)') &
+    df['dst_ip'].str.match(r'^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)')
+]
+
+# Identify hosts receiving unusually large amounts of data from multiple sources
+staging_candidates = internal_transfers.groupby('dst_ip').agg({
+    'src_ip': 'nunique',  # Number of unique sources
+    'bytes_in': 'sum',    # Total incoming bytes
+})
+
+# Filter for hosts receiving large data from multiple sources
+potential_staging = staging_candidates[
+    (staging_candidates['src_ip'] >= 3) &  # Data from multiple sources
+    (staging_candidates['bytes_in'] > staging_candidates['bytes_in'].quantile(0.95))  # Large volume
+]
+
+print(potential_staging.sort_values('bytes_in', ascending=False))
+
+# Further analyze top candidates to see if they connect to external destinations
+for staging_host in potential_staging.index:
+    # Check if this host then connects to external destinations
+    outbound = df[df['src_ip'] == staging_host & ~df['dst_ip'].str.match(r'^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.)')]
+    
+    if not outbound.empty:
+        print(f"Potential data staging host {staging_host} also connects to these external destinations:")
+        print(outbound.groupby('dst_ip')['bytes_out'].sum().sort_values(ascending=False).head(5))
+9. Detect Low and Slow Scanning
+New technique:
+Sophisticated attackers perform slow, distributed scans to avoid detection. These scans target specific high-value ports across many hosts.
+Implementation:
+pythonCopy# Focus on known high-value ports commonly targeted
+target_ports = [22, 23, 80, 443, 445, 3389, 5900, 8080, 8443, 1433, 3306, 5432]
+scan_flows = df[df['dst_port'].isin(target_ports)]
+
+# Create a time window for analysis (e.g., one day)
+scan_flows['date'] = scan_flows['start_time'].dt.date
+
+# Analyze scanning patterns by day
+for date, date_group in scan_flows.groupby('date'):
+    print(f"Analyzing scan patterns for {date}")
+    
+    # For each source IP, check how many unique destinations they hit on specific ports
+    for src_ip, src_group in date_group.groupby('src_ip'):
+        # Group by destination port
+        port_scans = {}
+        for port in target_ports:
+            port_targets = src_group[src_group['dst_port'] == port]['dst_ip'].nunique()
+            if port_targets > 5:  # Threshold for number of hosts scanned on this port
+                port_scans[port] = port_targets
+        
+        # If this source has scanned multiple hosts on high-value ports
+        if port_scans:
+            # Calculate scan rate (scans per hour)
+            time_range = (src_group['start_time'].max() - src_group['start_time'].min()).total_seconds() / 3600
+            scan_rate = sum(port_scans.values()) / time_range if time_range > 0 else float('inf')
+            
+            # Low and slow scans have a low scan rate but hit many targets
+            if scan_rate < 10 and sum(port_scans.values()) > 20:
+                print(f"Potential low and slow scan from {src_ip}:")
+                for port, targets in port_scans.items():
+                    print(f"  - Port {port}: {targets} unique targets")
+                print(f"  - Scan rate: {scan_rate:.2f} hosts per hour")
+10. Identify Suspicious Domain Resolution Patterns
+New technique:
+APTs often use domain generation algorithms (DGAs) or fast flux DNS to evade detection. Look for hosts resolving many unusual domains.
+Implementation (assuming NetFlow with DNS info):
+pythonCopy# Focus on DNS traffic
+dns_flows = df[df['dst_port'] == 53]
+
+# Count unique domains resolved by each internal host
+if 'domain' in dns_flows.columns:  # If domain info is available
+    domain_counts = dns_flows.groupby('src_ip')['domain'].nunique().sort_values(ascending=False)
+    print(f"Hosts resolving the most unique domains:\n{domain_counts.head(10)}")
+    
+    # Calculate domain name entropy (DGAs often have high entropy)
+    def domain_entropy(domain):
+        # Remove TLD
+        domain = domain.split('.')[-2] if len(domain.split('.')) > 1 else domain
+        # Calculate Shannon entropy
+        char_counts = pd.Series(list(domain)).value_counts(normalize=True)
+        return -sum(p * np.log2(p) for p in char_counts)
+    
+    # Apply to domains if available
+    if 'domain' in dns_flows.columns:
+        dns_flows['domain_entropy'] = dns_flows['domain'].apply(domain_entropy)
+        high_entropy_domains = dns_flows[dns_flows['domain_entropy'] > 3.5]
+        
+        # Group by source to find hosts resolving many high-entropy domains
+        suspicious_resolvers = high_entropy_domains.groupby('src_ip')['domain'].nunique().sort_values(ascending=False)
+        print(f"Hosts resolving many high-entropy domains (potential DGA activity):\n{suspicious_resolvers.head(10)}")
+else:
+    # If domain info not available, analyze DNS traffic patterns
+    dns_count_by_src = dns_flows.groupby('src_ip').size().sort_values(ascending=False)
+    print(f"Hosts with the most DNS traffic:\n{dns_count_by_src.head(10)}")
+    
+    # Look for periodic DNS queries (potential beaconing)
+    for src_ip, group in dns_flows.groupby('src_ip'):
+        if len(group) > 20:
+            # Sort by timestamp
+            group = group.sort_values('start_time')
+            
+            # Calculate time differences between consecutive DNS queries
+            time_diffs = group['start_time'].diff().dropna()
+            
+            if len(time_diffs) > 10:
+                # Convert to seconds
+                time_diffs_sec = time_diffs.dt.total_seconds()
+                
+                # Check for regular intervals
+                cv = time_diffs_sec.std() / time_diffs_sec.mean() if time_diffs_sec.mean() > 0 else float('inf')
+                
+                if cv < 0.3:  # Threshold for regularity
+                    print(f"Host {src_ip} shows regular DNS query patterns (potential C2 channel)")
+                    print(f"  Average interval: {time_diffs_sec.mean():.2f} seconds")
+General Tips for NetFlow Threat Hunting
+
+Establish baselines first: Understand what normal traffic looks like in your environment before hunting for anomalies.
+Combine multiple indicators: The most effective detections combine several suspicious patterns rather than relying on a single indicator.
+Focus on time windows: Analyze traffic patterns during specific time periods, especially outside business hours when legitimate traffic is low.
+Prioritize critical assets: Apply these hunting techniques with lower thresholds for high-value assets and servers.
+Iterative refinement: Start with broader patterns and progressively refine your queries based on initial findings.
+Enrich with context: When possible, join NetFlow data with other sources like DNS logs, authentication logs, and endpoint telemetry for more comprehensive hunting.
+
+These techniques can be adapted based on your specific environment and the format of your NetFlow CSV data. The key is to understand the typical attack patterns and translate them into detectable network traffic anomalies.
